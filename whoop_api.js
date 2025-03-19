@@ -5,9 +5,33 @@ const fs = require("fs");
 dotenv.config();
 
 const WHOOP_API_URL = "https://api.prod.whoop.com/developer/v1";
+const MAX_RETRIES = 3;
 
+// WHOOP Sport ID to Activity Name Mapping
+const WHOOP_SPORTS = {
+  "-1": "Activity",
+  0: "Running",
+  1: "Cycling",
+  16: "Baseball",
+  17: "Basketball",
+  18: "Rowing",
+  19: "Fencing",
+  20: "Field Hockey",
+  21: "Football",
+  22: "Golf",
+  24: "Ice Hockey",
+  25: "Lacrosse",
+  27: "Rugby",
+};
+
+/**
+ * Refresh WHOOP Access Token
+ * This function refreshes the WHOOP API access token when it expires.
+ */
 const refreshWhoopToken = async () => {
   try {
+    console.log("🔄 Refreshing WHOOP Access Token...");
+
     const response = await axios.post(
       "https://api.prod.whoop.com/oauth/oauth2/token",
       new URLSearchParams({
@@ -22,63 +46,125 @@ const refreshWhoopToken = async () => {
     const newAccessToken = response.data.access_token;
     const newRefreshToken = response.data.refresh_token;
 
-    // Update the .env file with new tokens
-    const envContent = `
-OPENAI_API_KEY=${process.env.OPENAI_API_KEY}
-STRAVA_CLIENT_ID=${process.env.STRAVA_CLIENT_ID}
-STRAVA_CLIENT_SECRET=${process.env.STRAVA_CLIENT_SECRET}
-STRAVA_ACCESS_TOKEN=${process.env.STRAVA_ACCESS_TOKEN}
-CLIENT_ID=${process.env.CLIENT_ID}
-CLIENT_SECRET=${process.env.CLIENT_SECRET}
-REDIRECT_URI=${process.env.REDIRECT_URI}
-WHOOP_API_HOSTNAME=${process.env.WHOOP_API_HOSTNAME}
-WHOOP_ACCESS_TOKEN=${newAccessToken}
-WHOOP_REFRESH_TOKEN=${newRefreshToken}
-    `.trim();
-
-    fs.writeFileSync(".env", envContent);
-
+    updateEnvFile(newAccessToken, newRefreshToken);
     console.log("✅ WHOOP Access Token Refreshed");
     return newAccessToken;
   } catch (error) {
-    console.error("❌ Error refreshing WHOOP token:", error.response?.data || error);
-    return null;
+    console.error("❌ WHOOP Refresh Token Expired. Manual reauthentication required.");
+    process.exit(1);
   }
 };
 
-const whoopRequest = async (endpoint) => {
+/**
+ * Update .env file with new WHOOP tokens
+ */
+const updateEnvFile = (newAccessToken, newRefreshToken) => {
+    const envConfig = dotenv.parse(fs.readFileSync(".env"));
+    envConfig.WHOOP_ACCESS_TOKEN = newAccessToken;
+    envConfig.WHOOP_REFRESH_TOKEN = newRefreshToken;
+
+    const updatedEnvContent = Object.entries(envConfig)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+
+    fs.writeFileSync(".env", updatedEnvContent);
+};
+
+/**
+ * WHOOP API Request Handler with Retry Logic
+ */
+const whoopRequest = async (endpoint, retries = 0) => {
   let token = process.env.WHOOP_ACCESS_TOKEN;
-    try {
+
+  try {
     const response = await axios.get(`${WHOOP_API_URL}/${endpoint}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    console.log(`✅ WHOOP ${endpoint} fetched successfully`, response.data);
-        return response.data.records;
+    console.log(`✅ WHOOP ${endpoint} fetched successfully`);
+    return response.data.records;
   } catch (error) {
     if (error.response?.status === 401) {
-      console.log("🔄 Token expired. Refreshing...");
+      if (retries === 0) console.log("🔄 Token expired. Refreshing...");
       token = await refreshWhoopToken();
       if (!token) return null;
-      return whoopRequest(endpoint);
+      return whoopRequest(endpoint, retries + 1);
     }
-    console.error(`❌ Error fetching WHOOP ${endpoint}:`, error.response?.data || error);
+
+    if (error.response?.status === 429 && retries < MAX_RETRIES) {
+      console.log(`⏳ Rate limited. Retrying (${retries + 1}/${MAX_RETRIES})...`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return whoopRequest(endpoint, retries + 1);
+    }
+
+    console.error(`❌ WHOOP API Error (${endpoint}):`, error.response?.data || error);
     return null;
   }
 };
 
+/**
+ * Fetch WHOOP Recovery Data
+ */
 const getWhoopRecovery = async () => await whoopRequest("recovery");
-const getWhoopStrain = async () => await whoopRequest("activity/workout");
+
+/**
+ * Fetch WHOOP Workouts with Sport Mapping & Date
+ */
+const getWhoopWorkouts = async () => {
+  const data = await whoopRequest("activity/workout");
+  if (!data) return [];
+  return data.map((workout) => ({
+    activity_type: WHOOP_SPORTS[workout.sport_id] || "Unknown",
+    start_time: workout.start,
+    strain_score: workout.score?.strain || "N/A",
+    average_heart_rate: workout.score?.average_heart_rate || "N/A",
+    max_heart_rate: workout.score?.max_heart_rate || "N/A",
+  }));
+};
+
+/**
+ * Fetch WHOOP Sleep Data
+ */
+const getWhoopSleep = async () => await whoopRequest("activity/sleep");
+
+/**
+ * Fetch WHOOP Strain Data
+ */
+const getWhoopStrain = async () => await whoopRequest("cycle");
+
+/**
+ * Fetch WHOOP Body Measurements
+ */
+const getWhoopBodyMeasurements = async () => await whoopRequest("user/measurement/body");
+
+/**
+ * Fetch All WHOOP Data
+ */
+const getWhoopData = async () => {
+  return {
+    recovery: await getWhoopRecovery(),
+    sleep: await getWhoopSleep(),
+    workouts: await getWhoopWorkouts(),
+    strain: await getWhoopStrain(),
+    body: await getWhoopBodyMeasurements(),
+  };
+};
 
 module.exports = {
   getWhoopRecovery,
-  getWhoopStrain
+  getWhoopWorkouts,
+  getWhoopSleep,
+  getWhoopStrain,
+  getWhoopBodyMeasurements,
+  getWhoopData,
 };
 
-const testWhoopAPI = async () => {
-  //console.log("Fetching WHOOP Recovery...");
-    await getWhoopRecovery();
-
-    await getWhoopStrain();
+/**
+ * Test WHOOP API Fetching
+ */
+/*const testWhoopAPI = async () => {
+  console.log("Fetching WHOOP Data...");
+  const data = await getWhoopData();
+  console.log(JSON.stringify(data, null, 2));
 };
 
-testWhoopAPI();
+testWhoopAPI();*/
